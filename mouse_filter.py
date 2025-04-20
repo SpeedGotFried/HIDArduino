@@ -1,39 +1,11 @@
-import ctypes
-import threading
 import numpy as np
+import threading
 import time
 import sys
 import argparse
 from collections import deque
-from ctypes import wintypes
-
-# Windows API constants
-WH_MOUSE_LL = 14
-WM_MOUSEMOVE = 0x0200
-WM_LBUTTONDOWN = 0x0201
-WM_LBUTTONUP = 0x0202
-WM_RBUTTONDOWN = 0x0204
-WM_RBUTTONUP = 0x0205
-WM_MBUTTONDOWN = 0x0207
-WM_MBUTTONUP = 0x0208
-
-# Load user32.dll
-user32 = ctypes.WinDLL('user32', use_last_error=True)
-
-# Define required Windows structures
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long),
-                ("y", ctypes.c_long)]
-
-class MSLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("pt", POINT),
-                ("mouseData", wintypes.DWORD),
-                ("flags", wintypes.DWORD),
-                ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulonglong))]
-
-# Define the hook callback
-HOOKPROC = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, wintypes.WPARAM, ctypes.POINTER(MSLLHOOKSTRUCT))
+from pynput import mouse
+from pynput.mouse import Button, Controller
 
 # Global settings
 SAMPLE_SIZE = 20  # Number of samples to analyze for tremor detection
@@ -44,7 +16,6 @@ SMOOTHING_FACTOR = 0.4  # Smoothing factor (0-1)
 mouse_history = deque(maxlen=SAMPLE_SIZE)
 tremor_detected = False
 stabilization_active = True
-hook_handle = None
 lock = threading.Lock()
 
 # Last positions for smoothing
@@ -52,6 +23,9 @@ last_x = 0
 last_y = 0
 last_real_x = 0
 last_real_y = 0
+
+# Create mouse controller
+mouse_controller = Controller()
 
 def calculate_magnitude(x, y):
     """Calculate the magnitude of movement vector."""
@@ -117,94 +91,41 @@ def apply_smoothing(x, y):
     
     return int(filtered_x), int(filtered_y)
 
-def get_cursor_pos():
-    """Get current cursor position."""
-    point = POINT()
-    user32.GetCursorPos(ctypes.byref(point))
-    return point.x, point.y
-
-def set_cursor_pos(x, y):
-    """Set cursor position."""
-    user32.SetCursorPos(x, y)
-
-def mouse_callback(n_code, w_param, l_param):
-    """Callback function for mouse hook."""
-    global tremor_detected, last_real_x, last_real_y
+def on_move(x, y):
+    """Callback for mouse movement."""
+    global tremor_detected, last_real_x, last_real_y, stabilization_active
     
-    if n_code < 0:
-        return user32.CallNextHookEx(hook_handle, n_code, w_param, l_param)
-    
-    if w_param == WM_MOUSEMOVE and stabilization_active:
-        # Get current cursor position
-        current_x, current_y = get_cursor_pos()
-        
+    with lock:
         # Calculate movement delta
-        dx = current_x - last_real_x
-        dy = current_y - last_real_y
+        dx = x - last_real_x
+        dy = y - last_real_y
         
         # Update last real position
-        last_real_x = current_x
-        last_real_y = current_y
+        last_real_x = x
+        last_real_y = y
         
-        # Only process if there's actual movement
-        if dx != 0 or dy != 0:
-            with lock:
-                # Detect tremor
-                tremor_detected = detect_tremor(dx, dy)
+        # Only process if there's actual movement and stabilization is active
+        if (dx != 0 or dy != 0) and stabilization_active:
+            # Detect tremor
+            tremor_detected = detect_tremor(dx, dy)
+            
+            # Apply smoothing if tremor detected
+            if tremor_detected:
+                # Get new smoothed position
+                new_x, new_y = apply_smoothing(x, y)
                 
-                # Apply smoothing if tremor detected
-                if tremor_detected:
-                    # Get new smoothed position
-                    new_x, new_y = apply_smoothing(current_x, current_y)
-                    
-                    # Set new cursor position
-                    set_cursor_pos(new_x, new_y)
-                    
-                    # We've handled this movement, prevent further processing
-                    return 1
+                # Set new cursor position without triggering this callback again
+                mouse_listener.stop()
+                mouse_controller.position = (new_x, new_y)
+                mouse_listener.start()
+                
+                # Update last real position to the smoothed position
+                last_real_x = new_x
+                last_real_y = new_y
+                
+                return False  # Prevents default action
     
-    # Let Windows process other mouse events normally
-    return user32.CallNextHookEx(hook_handle, n_code, w_param, l_param)
-
-def start_hook():
-    """Set up and start the mouse hook."""
-    global hook_handle, last_real_x, last_real_y
-    
-    # Initialize last position
-    last_real_x, last_real_y = get_cursor_pos()
-    
-    # Create callback function
-    callback = HOOKPROC(mouse_callback)
-    
-    # Set the hook
-    hook_handle = user32.SetWindowsHookExW(
-        WH_MOUSE_LL,
-        callback,
-        ctypes.windll.kernel32.GetModuleHandleW(None),
-        0
-    )
-    
-    if not hook_handle:
-        raise ctypes.WinError(ctypes.get_last_error())
-    
-    print("Mouse hook successfully installed")
-    
-    # Create message loop
-    msg = wintypes.MSG()
-    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-        user32.TranslateMessage(ctypes.byref(msg))
-        user32.DispatchMessageW(ctypes.byref(msg))
-
-def stop_hook():
-    """Remove the mouse hook."""
-    global hook_handle
-    
-    if hook_handle:
-        if user32.UnhookWindowsHookEx(hook_handle):
-            print("Mouse hook successfully removed")
-        else:
-            print("Failed to remove mouse hook")
-        hook_handle = None
+    return True  # Allow the default action
 
 def status_monitor():
     """Display tremor detection status periodically."""
@@ -233,10 +154,10 @@ def toggle_stabilization():
     print(f"\nStabilization {'ENABLED' if stabilization_active else 'DISABLED'}")
 
 def main():
-    global SHAKE_THRESHOLD, SMOOTHING_FACTOR, SAMPLE_SIZE
+    global SHAKE_THRESHOLD, SMOOTHING_FACTOR, SAMPLE_SIZE, last_real_x, last_real_y, mouse_listener
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Windows Mouse Tremor Filter")
+    parser = argparse.ArgumentParser(description="Mouse Tremor Filter")
     parser.add_argument('--threshold', type=float, default=1.7, help='Tremor detection threshold (default: 1.7)')
     parser.add_argument('--smoothing', type=float, default=0.4, help='Smoothing factor (default: 0.4)')
     parser.add_argument('--samples', type=int, default=20, help='Sample size for tremor detection (default: 20)')
@@ -247,19 +168,24 @@ def main():
     SMOOTHING_FACTOR = args.smoothing
     SAMPLE_SIZE = args.samples
     
-    print("Windows Mouse Tremor Filter v1.0")
-    print("================================")
+    print("Mouse Tremor Filter v1.0")
+    print("=======================")
     print(f"Tremor Threshold: {SHAKE_THRESHOLD}")
     print(f"Smoothing Factor: {SMOOTHING_FACTOR}")
     print(f"Sample Size: {SAMPLE_SIZE}")
     print("Starting stabilization system...")
+    
+    # Initialize last position
+    pos = mouse_controller.position
+    last_real_x, last_real_y = pos
+    last_x, last_y = pos
     
     # Start status monitor in a background thread
     status_thread = threading.Thread(target=status_monitor)
     status_thread.daemon = True
     status_thread.start()
     
-    # Create keyboard listener thread for commands
+    # Create keyboard input thread for commands
     def key_monitor():
         print("\nPress 'q' to quit, 's' to toggle stabilization")
         while True:
@@ -267,7 +193,7 @@ def main():
                 key = input()
                 if key.lower() == 'q':
                     print("\nShutting down...")
-                    stop_hook()
+                    mouse_listener.stop()
                     sys.exit(0)
                 elif key.lower() == 's':
                     toggle_stabilization()
@@ -279,12 +205,15 @@ def main():
     key_thread.start()
     
     try:
-        # Start the mouse hook
-        start_hook()
+        # Set up the mouse listener
+        mouse_listener = mouse.Listener(on_move=on_move)
+        mouse_listener.start()
+        
+        # Keep the main thread alive
+        mouse_listener.join()
     except KeyboardInterrupt:
         print("\nShutting down...")
-    finally:
-        stop_hook()
+        mouse_listener.stop()
 
 if __name__ == "__main__":
     main() 
